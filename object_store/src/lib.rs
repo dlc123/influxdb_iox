@@ -140,7 +140,7 @@ impl ObjectStore {
             AmazonS3(s3) => s3.list_with_delimiter(prefix, &None).await,
             GoogleCloudStorage(_gcs) => unimplemented!(),
             InMemory(in_mem) => in_mem.list_with_delimiter(prefix, &None).await,
-            File(_file) => unimplemented!(),
+            File(file) => file.list_with_delimiter(prefix, &None).await,
             MicrosoftAzure(_azure) => unimplemented!(),
         }
     }

@@ -2,13 +2,14 @@
 //! object store.
 use crate::{
     path::{file::FileConverter, ObjectStorePath},
-    DataDoesNotMatchLength, Result, UnableToCopyDataToFile, UnableToCreateDir, UnableToCreateFile,
-    UnableToDeleteFile, UnableToOpenFile, UnableToPutDataInMemory, UnableToReadBytes,
+    DataDoesNotMatchLength, ListResult, ObjectMeta, Result, UnableToCopyDataToFile,
+    UnableToCreateDir, UnableToCreateFile, UnableToDeleteFile, UnableToOpenFile,
+    UnableToPutDataInMemory, UnableToReadBytes,
 };
 use bytes::Bytes;
 use futures::{stream, Stream, TryStreamExt};
 use snafu::{ensure, futures::TryStreamExt as _, OptionExt, ResultExt};
-use std::{io, path::PathBuf};
+use std::{convert::TryFrom, io, path::PathBuf};
 use tokio::fs;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use walkdir::WalkDir;
@@ -132,6 +133,53 @@ impl File {
 
         Ok(stream::iter(s))
     }
+
+    /// List objects with the given prefix. Returns common prefixes
+    /// (directories) in addition to object metadata.
+    ///
+    /// Returns all results, as opposed to the cloud versions which
+    /// limit their results because of API limitations.
+    pub async fn list_with_delimiter<'a>(
+        &'a self,
+        prefix: &'a ObjectStorePath,
+        _: &Option<u8>,
+    ) -> Result<ListResult> {
+        let root_path = FileConverter::convert(&self.root);
+        let prefix = FileConverter::convert(prefix);
+        let search_path = root_path.join(prefix);
+
+        let walkdir = WalkDir::new(&search_path).min_depth(1).max_depth(1);
+
+        let mut common_prefixes = Vec::new();
+        let mut objects = Vec::new();
+
+        for e in walkdir {
+            let e = e.expect("TODO");
+
+            let path = e.path().strip_prefix(&root_path).expect("TODO");
+            let location = ObjectStorePath::from_path_buf_unchecked(path);
+            let metadata = e.metadata().expect("TODO");
+
+            if metadata.is_dir() {
+                common_prefixes.push(location);
+            } else {
+                let last_modified = metadata.modified().expect("TODO").into();
+                let size = usize::try_from(metadata.len()).unwrap_or(0); // TODO: is this valid?
+
+                objects.push(ObjectMeta {
+                    location,
+                    last_modified,
+                    size,
+                });
+            }
+        }
+
+        Ok(ListResult {
+            next_token: None,
+            common_prefixes,
+            objects,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -143,7 +191,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::{tests::put_get_delete_list, Error, ObjectStore};
+    use crate::{
+        tests::{list_with_delimiter, put_get_delete_list},
+        Error, ObjectStore,
+    };
     use futures::stream;
 
     #[tokio::test]
@@ -152,6 +203,9 @@ mod tests {
         let integration = ObjectStore::new_file(File::new(root.path()));
 
         put_get_delete_list(&integration).await?;
+
+        list_with_delimiter(&integration).await?;
+
         Ok(())
     }
 
