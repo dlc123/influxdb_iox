@@ -1,14 +1,18 @@
 //! This module contains the IOx implementation for using Google Cloud Storage
 //! as the object store.
-use crate::{path::cloud::CloudPath, ListResult, ObjectStoreApi};
+use crate::{
+    path::{cloud::CloudPath, DELIMITER},
+    ListResult, ObjectMeta, ObjectStoreApi,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
+    future,
     stream::{self, BoxStream},
     Stream, StreamExt, TryStreamExt,
 };
 use snafu::{ensure, futures::TryStreamExt as _, ResultExt, Snafu};
-use std::io;
+use std::{convert::TryFrom, io};
 
 /// A specialized `Result` for Google Cloud Storage object store-related errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -191,8 +195,59 @@ impl ObjectStoreApi for GoogleCloudStorage {
         Ok(objects.boxed())
     }
 
-    async fn list_with_delimiter(&self, _prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
-        unimplemented!();
+    async fn list_with_delimiter(&self, prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
+        let cloud_prefix = prefix.to_raw();
+        let results = cloud_storage::Object::list_prefix_delimiter(
+            &self.bucket_name,
+            &cloud_prefix,
+            DELIMITER,
+        )
+        .await
+        .context(UnableToListData {
+            bucket: &self.bucket_name,
+        })?;
+
+        let mut objects = vec![];
+        let mut common_prefixes = vec![];
+
+        results
+            .try_for_each(|(object_list, prefix_list)| {
+                let mut os: Vec<_> = object_list
+                    .into_iter()
+                    .map(|object| {
+                        let location = CloudPath::raw(object.name);
+                        let last_modified = object.updated;
+                        let size = usize::try_from(object.size)
+                            .expect("unsupported size on this platform");
+
+                        ObjectMeta {
+                            location,
+                            last_modified,
+                            size,
+                        }
+                    })
+                    .collect();
+
+                objects.append(&mut os);
+
+                let mut ps: Vec<_> = prefix_list.into_iter().map(|p| CloudPath::raw(p)).collect();
+
+                common_prefixes.append(&mut ps);
+
+                future::ready(Ok(()))
+            })
+            .await
+            .context(UnableToStreamListData {
+                bucket: &self.bucket_name,
+            })?;
+
+        let result = ListResult {
+            objects,
+            common_prefixes,
+            next_token: None,
+        };
+
+        Ok(result)
     }
 }
 
@@ -209,7 +264,7 @@ impl GoogleCloudStorage {
 mod test {
     use super::*;
     use crate::{
-        tests::{get_nonexistent_object, put_get_delete_list},
+        tests::{get_nonexistent_object, list_with_delimiter, put_get_delete_list},
         GoogleCloudStorage, ObjectStoreApi, ObjectStorePath,
     };
     use bytes::Bytes;
@@ -254,6 +309,7 @@ mod test {
 
         let integration = GoogleCloudStorage::new(&bucket_name);
         put_get_delete_list(&integration).await?;
+        list_with_delimiter(&integration).await?;
         Ok(())
     }
 
@@ -359,14 +415,27 @@ mod test {
         let data = Bytes::from("arbitrary data");
         let stream_data = std::io::Result::Ok(data.clone());
 
-        let result = integration
+        let err = integration
             .put(
                 &location,
                 futures::stream::once(async move { stream_data }),
                 data.len(),
             )
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap_err();
+
+        if let Error::UnableToPutData {
+            source,
+            bucket,
+            location,
+        } = err
+        {
+            assert!(matches!(source, cloud_storage::Error::Other(_)));
+            assert_eq!(bucket, bucket_name);
+            assert_eq!(location, NON_EXISTENT_NAME);
+        } else {
+            panic!("unexpected error type");
+        }
 
         Ok(())
     }
