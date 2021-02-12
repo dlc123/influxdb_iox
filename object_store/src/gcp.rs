@@ -7,7 +7,6 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
-    future,
     stream::{self, BoxStream},
     Stream, StreamExt, TryStreamExt,
 };
@@ -212,29 +211,22 @@ impl ObjectStoreApi for GoogleCloudStorage {
 
         results
             .try_for_each(|(object_list, prefix_list)| {
-                let mut os: Vec<_> = object_list
-                    .into_iter()
-                    .map(|object| {
-                        let location = CloudPath::raw(object.name);
-                        let last_modified = object.updated;
-                        let size = usize::try_from(object.size)
-                            .expect("unsupported size on this platform");
+                objects.extend(object_list.into_iter().map(|object| {
+                    let location = CloudPath::raw(object.name);
+                    let last_modified = object.updated;
+                    let size =
+                        usize::try_from(object.size).expect("unsupported size on this platform");
 
-                        ObjectMeta {
-                            location,
-                            last_modified,
-                            size,
-                        }
-                    })
-                    .collect();
+                    ObjectMeta {
+                        location,
+                        last_modified,
+                        size,
+                    }
+                }));
 
-                objects.append(&mut os);
+                common_prefixes.extend(prefix_list.into_iter().map(CloudPath::raw));
 
-                let mut ps: Vec<_> = prefix_list.into_iter().map(|p| CloudPath::raw(p)).collect();
-
-                common_prefixes.append(&mut ps);
-
-                future::ready(Ok(()))
+                async { Ok(()) }
             })
             .await
             .context(UnableToStreamListData {
