@@ -1,8 +1,11 @@
 //! This module contains the IOx implementation for using Azure Blob storage as
 //! the object store.
-use crate::{path::cloud::CloudPath, ListResult, ObjectStoreApi};
+use crate::{
+    path::{cloud::CloudPath, DELIMITER},
+    ListResult, ObjectMeta, ObjectStoreApi,
+};
 use async_trait::async_trait;
-use azure_core::HttpClient;
+use azure_core::{Delimiter, HttpClient};
 use azure_storage::{
     clients::{
         AsBlobClient, AsContainerClient, AsStorageClient, ContainerClient, StorageAccountClient,
@@ -15,8 +18,8 @@ use futures::{
     FutureExt, Stream, StreamExt, TryStreamExt,
 };
 use snafu::{ensure, ResultExt, Snafu};
-use std::io;
 use std::sync::Arc;
+use std::{convert::TryInto, io};
 
 /// A specialized `Result` for Azure object store-related errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -184,8 +187,49 @@ impl ObjectStoreApi for MicrosoftAzure {
         .boxed())
     }
 
-    async fn list_with_delimiter(&self, _prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
-        unimplemented!();
+    async fn list_with_delimiter(&self, prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
+        let mut request = self.container_client.list_blobs();
+
+        let prefix = prefix.to_raw();
+
+        request = request.delimiter(Delimiter::new(DELIMITER));
+        request = request.prefix(&*prefix);
+
+        let resp = request.execute().await.context(UnableToListData)?;
+
+        let next_token = resp
+            .incomplete_vector
+            .next_marker
+            .as_ref()
+            .map(|m| m.as_str().to_string());
+
+        let common_prefixes = todo!("https://github.com/Azure/azure-sdk-for-rust/issues/175");
+
+        let objects = resp
+            .incomplete_vector
+            .vector
+            .into_iter()
+            .map(|blob| {
+                let location = CloudPath::raw(blob.name);
+                let last_modified = blob.last_modified.expect("TODO");
+                let size = blob
+                    .content_length
+                    .try_into()
+                    .expect("unsupported size on this platform");
+
+                ObjectMeta {
+                    location,
+                    last_modified,
+                    size,
+                }
+            })
+            .collect();
+
+        Ok(ListResult {
+            next_token,
+            common_prefixes,
+            objects,
+        })
     }
 }
 
